@@ -1,0 +1,139 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  yamanashi-event-stream Consumer 最小構成
+  別アカウントのProducerからEventBridge経由でイベントを受信し、Lambda で処理する
+
+Parameters:
+  ProducerAccountId:
+    Type: String
+    Description: Producer を運用している AWS アカウント ID
+    AllowedPattern: '[0-9]{12}'
+    ConstraintDescription: AWS アカウント ID は12桁の数字である必要があります
+
+  ConsumerBusName:
+    Type: String
+    Default: yamanashi-event-consumer
+    Description: 作成する custom EventBridge bus の名前
+    AllowedPattern: '[a-zA-Z0-9\-_]+'
+    ConstraintDescription: バス名は英数字、ハイフン、アンダースコアのみ使用可能です
+
+  FilterGroupKey:
+    Type: String
+    Default: ''
+    Description: 特定の group_key だけ受信したい場合に指定する。空なら全件受信
+
+Conditions:
+  # group_key フィルタが指定されているかどうか
+  HasGroupKeyFilter: !Not [!Equals [!Ref FilterGroupKey, '']]
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: python3.12
+
+Resources:
+  # Custom EventBridge Bus
+  ConsumerEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Ref ConsumerBusName
+
+  # EventBridge Bus Policy (cross-account access)
+  ConsumerEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref ConsumerEventBus
+      StatementId: AllowCrossAccountPutEvents
+      Statement:
+        Sid: AllowProducerAccountPutEvents
+        Effect: Allow
+        Principal:
+          AWS: !Sub 'arn:aws:iam::${ProducerAccountId}:root'
+        Action: events:PutEvents
+        Resource: !GetAtt ConsumerEventBus.Arn
+
+  # Consumer Lambda Function
+  ConsumerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ConsumerBusName}-consumer'
+      CodeUri: consumer/
+      Handler: app.lambda_handler
+      Description: 山yamanashi-event-stream Producer のイベントを受信して CloudWatch Logs に出力
+      Events:
+        # group_key フィルタありの場合
+        EventBridgeRuleWithGroupFilter:
+          Type: EventBridgeRule
+          Condition: HasGroupKeyFilter
+          Properties:
+            EventBusName: !Ref ConsumerEventBus
+            Pattern:
+              source:
+                - yamanashi.tech.events
+              detail-type:
+                - event.created
+              detail:
+                group_key:
+                  - !Ref FilterGroupKey
+        # group_key フィルタなしの場合
+        EventBridgeRuleWithoutGroupFilter:
+          Type: EventBridgeRule
+          Condition: !Not [!Condition HasGroupKeyFilter]
+          Properties:
+            EventBusName: !Ref ConsumerEventBus
+            Pattern:
+              source:
+                - yamanashi.tech.events
+              detail-type:
+                - event.created
+
+  # Lambda の実行ロール（自動作成されるが、明示的に権限を確認したい場合）
+  ConsumerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ConsumerBusName}-consumer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+Outputs:
+  ConsumerEventBusName:
+    Description: 作成された EventBridge bus の名前
+    Value: !Ref ConsumerEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-ConsumerEventBusName'
+
+  ConsumerEventBusArn:
+    Description: 作成された EventBridge bus の ARN
+    Value: !GetAtt ConsumerEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConsumerEventBusArn'
+
+  ConsumerFunctionName:
+    Description: Consumer Lambda 関数名
+    Value: !Ref ConsumerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ConsumerFunctionName'
+
+  ConsumerRuleName:
+    Description: EventBridge ルール名
+    Value: !If
+      - HasGroupKeyFilter
+      - !Sub '${ConsumerFunction}EventBridgeRuleWithGroupFilter'
+      - !Sub '${ConsumerFunction}EventBridgeRuleWithoutGroupFilter'
+
+  ProducerAccountId:
+    Description: 設定されたProducerアカウントID
+    Value: !Ref ProducerAccountId
+    
+  FilterGroupKey:
+    Description: 設定されたgroup_keyフィルタ
+    Value: !If [HasGroupKeyFilter, !Ref FilterGroupKey, '全件受信']
